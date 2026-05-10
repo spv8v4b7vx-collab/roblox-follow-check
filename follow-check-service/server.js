@@ -3,11 +3,12 @@
  * Optional: ?secret=... if env FOLLOW_CHECK_SECRET is set (same value in Roblox script).
  *
  * Checks: follower's /followings contains target, then target's /followers contains follower.
+ * Yrittää ensin roproxy (usein vähemmän 401), sitten suora friends.roblox.com.
  */
 
 const express = require("express");
 
-const ROBLOX_FRIENDS = "https://friends.roblox.com";
+const FRIENDS_HOSTS = ["https://friends.roproxy.com", "https://friends.roblox.com"];
 const PAGE_LIMIT = 100;
 const MAX_PAGES = 80;
 
@@ -29,7 +30,6 @@ function deepContainsUserId(obj, needle) {
 	return false;
 }
 
-// Roblox Friends API on joskus tiukka User-Agentin suhteen; selaintyylinen UA auttaa datacenter-IP:llä.
 const ROBLOX_HEADERS = {
 	Accept: "application/json",
 	"User-Agent":
@@ -57,20 +57,46 @@ async function fetchRobloxJson(url) {
 
 async function scanPagedList(ownerUserId, listName, needleUserId) {
 	let cursor = "";
+	let lockedBase = null;
+	const sortParts = ["&sortOrder=Desc", ""];
+
 	for (let page = 0; page < MAX_PAGES; page++) {
-		// API: limit ∈ {10,18,25,50,100}; sortOrder suositeltu (Luau-skriptin kanssa sama).
-		let url = `${ROBLOX_FRIENDS}/v1/users/${ownerUserId}/${listName}?limit=${PAGE_LIMIT}&sortOrder=Desc`;
-		if (cursor) {
-			url += `&cursor=${encodeURIComponent(cursor)}`;
+		let decoded = null;
+		let pageOk = false;
+
+		for (const sp of sortParts) {
+			let path = `/v1/users/${ownerUserId}/${listName}?limit=${PAGE_LIMIT}${sp}`;
+			if (cursor) {
+				path += `&cursor=${encodeURIComponent(cursor)}`;
+			}
+			const bases = lockedBase ? [lockedBase] : FRIENDS_HOSTS;
+			for (const base of bases) {
+				const url = base + path;
+				try {
+					decoded = await fetchRobloxJson(url);
+					lockedBase = base;
+					pageOk = true;
+					break;
+				} catch (e) {
+					/* try next host / sort */
+				}
+			}
+			if (pageOk) break;
 		}
-		const data = await fetchRobloxJson(url);
-		const arr = Array.isArray(data?.data) ? data.data : [];
+
+		if (!pageOk || decoded == null) {
+			const err = new Error("All Friends hosts / sort variants failed for this page");
+			err.status = 502;
+			throw err;
+		}
+
+		const arr = Array.isArray(decoded?.data) ? decoded.data : [];
 		for (const entry of arr) {
 			if (deepContainsUserId(entry, needleUserId)) {
 				return true;
 			}
 		}
-		const next = data?.nextPageCursor;
+		const next = decoded?.nextPageCursor;
 		if (typeof next !== "string" || next === "") {
 			break;
 		}
@@ -87,6 +113,7 @@ app.get("/", (_req, res) => {
 	res.json({
 		service: "roblox-follow-check",
 		endpoint: "GET /checkfollow?follower=USERID&target=TARGETID",
+		hosts: FRIENDS_HOSTS,
 	});
 });
 
@@ -123,5 +150,5 @@ app.get("/checkfollow", async (req, res) => {
 
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => {
-	console.log(`follow-check listening on ${port}`);
+	console.log(`follow-check listening on ${port}`, FRIENDS_HOSTS.join(", "));
 });
