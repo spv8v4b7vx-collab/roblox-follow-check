@@ -29,13 +29,15 @@ function deepContainsUserId(obj, needle) {
 	return false;
 }
 
+// Roblox Friends API on joskus tiukka User-Agentin suhteen; selaintyylinen UA auttaa datacenter-IP:llä.
+const ROBLOX_HEADERS = {
+	Accept: "application/json",
+	"User-Agent":
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+};
+
 async function fetchRobloxJson(url) {
-	const res = await fetch(url, {
-		headers: {
-			Accept: "application/json",
-			"User-Agent": "RenderFollowCheck/1.0 (Roblox game follow verify)",
-		},
-	});
+	const res = await fetch(url, { headers: ROBLOX_HEADERS });
 	const text = await res.text();
 	let body;
 	try {
@@ -47,6 +49,7 @@ async function fetchRobloxJson(url) {
 		const err = new Error(`Roblox HTTP ${res.status}`);
 		err.status = res.status;
 		err.body = body;
+		err.snippet = text.length > 400 ? text.slice(0, 400) + "…" : text;
 		throw err;
 	}
 	return body;
@@ -55,7 +58,8 @@ async function fetchRobloxJson(url) {
 async function scanPagedList(ownerUserId, listName, needleUserId) {
 	let cursor = "";
 	for (let page = 0; page < MAX_PAGES; page++) {
-		let url = `${ROBLOX_FRIENDS}/v1/users/${ownerUserId}/${listName}?limit=${PAGE_LIMIT}`;
+		// API: limit ∈ {10,18,25,50,100}; sortOrder suositeltu (Luau-skriptin kanssa sama).
+		let url = `${ROBLOX_FRIENDS}/v1/users/${ownerUserId}/${listName}?limit=${PAGE_LIMIT}&sortOrder=Desc`;
 		if (cursor) {
 			url += `&cursor=${encodeURIComponent(cursor)}`;
 		}
@@ -108,7 +112,7 @@ app.get("/checkfollow", async (req, res) => {
 		}
 		return res.json({ follows });
 	} catch (e) {
-		console.error("[checkfollow]", e.message || e);
+		console.error("[checkfollow]", e.message || e, e.snippet || e.body || "");
 		const status = e.status >= 400 && e.status < 600 ? e.status : 502;
 		return res.status(status >= 400 ? status : 502).json({
 			error: "upstream_failed",
