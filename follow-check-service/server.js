@@ -126,10 +126,30 @@ app.get("/checkfollow", async (req, res) => {
 		}
 	}
 
-	const follower = parseInt(String(req.query.follower ?? ""), 10);
-	const target = parseInt(String(req.query.target ?? ""), 10);
+	function parseRobloxUserId(q, key) {
+		const raw = q[key];
+		if (raw === undefined || raw === null) {
+			return NaN;
+		}
+		const one = Array.isArray(raw) ? raw[0] : raw;
+		const n = parseInt(String(one).trim(), 10);
+		if (!Number.isFinite(n) || n <= 0) {
+			return NaN;
+		}
+		return n;
+	}
+
+	const follower = parseRobloxUserId(req.query, "follower");
+	const target = parseRobloxUserId(req.query, "target");
 	if (!Number.isFinite(follower) || !Number.isFinite(target)) {
-		return res.status(400).json({ error: "invalid follower or target" });
+		return res.status(400).json({
+			error: "invalid follower or target",
+			hint: "GET /checkfollow?follower=<playing user's UserId>&target=<creator UserId>",
+			received: {
+				follower: req.query.follower,
+				target: req.query.target,
+			},
+		});
 	}
 
 	try {
