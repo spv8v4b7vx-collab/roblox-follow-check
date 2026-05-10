@@ -1,16 +1,14 @@
 /**
  * GET /checkfollow?follower=USERID&target=TARGETID
- * Optional: ?secret=... if env FOLLOW_CHECK_SECRET is set (same value in Roblox script).
- *
- * Checks: follower's /followings contains target, then target's /followers contains follower.
- * Yrittää ensin roproxy (usein vähemmän 401), sitten suora friends.roblox.com.
  */
 
 const express = require("express");
 
 const FRIENDS_HOSTS = ["https://friends.roproxy.com", "https://friends.roblox.com"];
-const PAGE_LIMIT = 100;
+const LIMITS_FIRST_PAGE = [100, 50, 25];
+const SORT_VARIANTS = ["&sortOrder=Desc", "&sortOrder=Asc", ""];
 const MAX_PAGES = 80;
+const FETCH_MS = 45000;
 
 const app = express();
 
@@ -32,71 +30,97 @@ function deepContainsUserId(obj, needle) {
 
 const ROBLOX_HEADERS = {
 	Accept: "application/json",
+	"Accept-Language": "en-US,en;q=0.9",
 	"User-Agent":
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	Referer: "https://www.roblox.com/",
+	Origin: "https://www.roblox.com",
 };
 
 async function fetchRobloxJson(url) {
-	const res = await fetch(url, { headers: ROBLOX_HEADERS });
-	const text = await res.text();
-	let body;
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), FETCH_MS);
 	try {
-		body = JSON.parse(text);
-	} catch {
-		body = null;
+		const res = await fetch(url, { headers: ROBLOX_HEADERS, signal: ctrl.signal });
+		const text = await res.text();
+		let body;
+		try {
+			body = JSON.parse(text);
+		} catch {
+			body = null;
+		}
+		if (!res.ok) {
+			const err = new Error(`HTTP ${res.status}`);
+			err.status = res.status;
+			err.body = body;
+			err.snippet = text.length > 280 ? text.slice(0, 280) + "…" : text;
+			throw err;
+		}
+		return body;
+	} finally {
+		clearTimeout(timer);
 	}
-	if (!res.ok) {
-		const err = new Error(`Roblox HTTP ${res.status}`);
-		err.status = res.status;
-		err.body = body;
-		err.snippet = text.length > 400 ? text.slice(0, 400) + "…" : text;
-		throw err;
+}
+
+/**
+ * Yksi sivu: kokeilee host + limit + sort -yhdistelmiä kunnes yksi onnistuu.
+ * Palauttaa { data, lock } missä lock kiinnitetään seuraaviin sivuihin.
+ */
+async function fetchFriendsOnePage(ownerUserId, listName, cursor, lock) {
+	const failures = [];
+	const bases = lock?.base ? [lock.base] : FRIENDS_HOSTS;
+	const limits = lock?.limit != null ? [lock.limit] : LIMITS_FIRST_PAGE;
+	const sorts = lock?.sort !== undefined ? [lock.sort] : SORT_VARIANTS;
+
+	for (const lim of limits) {
+		for (const sp of sorts) {
+			let path = `/v1/users/${ownerUserId}/${listName}?limit=${lim}${sp}`;
+			if (cursor) {
+				path += `&cursor=${encodeURIComponent(cursor)}`;
+			}
+			for (const base of bases) {
+				const url = base + path;
+				const shortHost = base.replace("https://", "");
+				try {
+					const data = await fetchRobloxJson(url);
+					return {
+						data,
+						lock: {
+							base,
+							limit: lim,
+							sort: sp,
+						},
+					};
+				} catch (e) {
+					const st = e.status ?? "abort";
+					failures.push(`${shortHost} lim=${lim} → ${st} ${e.message}`);
+				}
+			}
+		}
 	}
-	return body;
+
+	const msg = failures.length ? failures.join(" | ") : "no attempts";
+	const err = new Error(msg);
+	err.status = 502;
+	err.failures = failures;
+	throw err;
 }
 
 async function scanPagedList(ownerUserId, listName, needleUserId) {
 	let cursor = "";
-	let lockedBase = null;
-	const sortParts = ["&sortOrder=Desc", ""];
+	let lock = null;
 
 	for (let page = 0; page < MAX_PAGES; page++) {
-		let decoded = null;
-		let pageOk = false;
+		const { data, lock: newLock } = await fetchFriendsOnePage(ownerUserId, listName, cursor || "", lock);
+		lock = newLock;
 
-		for (const sp of sortParts) {
-			let path = `/v1/users/${ownerUserId}/${listName}?limit=${PAGE_LIMIT}${sp}`;
-			if (cursor) {
-				path += `&cursor=${encodeURIComponent(cursor)}`;
-			}
-			const bases = lockedBase ? [lockedBase] : FRIENDS_HOSTS;
-			for (const base of bases) {
-				const url = base + path;
-				try {
-					decoded = await fetchRobloxJson(url);
-					lockedBase = base;
-					pageOk = true;
-					break;
-				} catch (e) {
-					/* try next host / sort */
-				}
-			}
-			if (pageOk) break;
-		}
-
-		if (!pageOk || decoded == null) {
-			const err = new Error("All Friends hosts / sort variants failed for this page");
-			err.status = 502;
-			throw err;
-		}
-
-		const arr = Array.isArray(decoded?.data) ? decoded.data : [];
+		const arr = Array.isArray(data?.data) ? data.data : [];
 		for (const entry of arr) {
 			if (deepContainsUserId(entry, needleUserId)) {
 				return true;
 			}
 		}
-		const next = decoded?.nextPageCursor;
+		const next = data?.nextPageCursor;
 		if (typeof next !== "string" || next === "") {
 			break;
 		}
@@ -159,16 +183,17 @@ app.get("/checkfollow", async (req, res) => {
 		}
 		return res.json({ follows });
 	} catch (e) {
-		console.error("[checkfollow]", e.message || e, e.snippet || e.body || "");
+		console.error("[checkfollow]", e.message || e);
 		const status = e.status >= 400 && e.status < 600 ? e.status : 502;
 		return res.status(status >= 400 ? status : 502).json({
 			error: "upstream_failed",
 			message: String(e.message || e),
+			detail: e.failures ? e.failures.slice(0, 20) : undefined,
 		});
 	}
 });
 
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => {
-	console.log(`follow-check listening on ${port}`, FRIENDS_HOSTS.join(", "));
+	console.log(`follow-check listening on ${port}`);
 });
