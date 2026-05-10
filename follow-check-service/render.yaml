@@ -1,0 +1,13 @@
+# Optional: Render Blueprint — tai luo Web Service käsin Dashboardissa.
+services:
+  - type: web
+    name: roblox-follow-check
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # - key: FOLLOW_CHECK_SECRET
+      #   sync: false
